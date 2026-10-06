@@ -10,8 +10,8 @@ module BadgeService.StoreReceipts.Apple
   )
 where
 
-import BadgeService.StoreReceipts (VerifiedStoreTransaction (..))
-import Control.Exception (Exception, IOException, throw, try)
+import BadgeService.StoreReceipts (StoreVerifierFailure (..), VerifiedStoreTransaction (..))
+import Control.Exception (IOException, throw, try)
 import Control.Monad (guard, unless)
 import Crypto.Hash.Algorithms (SHA256 (..))
 import Crypto.Number.Serialize (os2ip)
@@ -32,16 +32,9 @@ import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word32)
 import Data.X509
 import Data.X509.EC (unserializePoint)
-import Data.X509.Validation (SignatureVerification (SignaturePass), verifySignedSignature)
+import Data.X509.Validation (SignatureFailure (..), SignatureVerification (..), verifySignedSignature)
 import Simplex.Chat.PaymentService.Types (CurrencyAmount (..))
 import Simplex.Messaging.Util (eitherToMaybe)
-
--- | Thrown, never returned, for evidence Apple did sign but in a shape this verifier does not know,
--- since every Left is a terminal refusal.
-newtype AppleVerifierFailure = AppleVerifierFailure String
-  deriving (Show)
-
-instance Exception AppleVerifierFailure
 
 verifyAppleTransaction :: SignedCertificate -> Text -> Text -> Either Text VerifiedStoreTransaction
 verifyAppleTransaction root ourBundleId jws = case T.splitOn "." jws of
@@ -50,7 +43,7 @@ verifyAppleTransaction root ourBundleId jws = case T.splitOn "." jws of
     sig <- jwsSignature signature
     unless (ECDSA.verify SHA256 (leafKey leaf) sig (encodeUtf8 $ header <> "." <> payload)) $
       Left "the signature does not verify"
-    transaction ourBundleId $ either (failed . ("the payload Apple signed is not a transaction: " <>)) id $ do
+    transaction ourBundleId $ either (const $ failed "the payload Apple signed is not a transaction") id $ do
       o <- maybe (Left "not base64url JSON") Right $ jsonObject payload
       JT.parseEither appleTransactionP o
   _ -> Left "not three dot-separated parts"
@@ -75,9 +68,12 @@ signingChain root = \case
   [leafDer, intermediateDer, _] -> do
     leaf <- certificate leafDer
     intermediate <- certificate intermediateDer
-    -- the configured root may be stale or wrong as likely as the receipt forged, so this decides nothing
+    -- the configured root may be stale or wrong as likely as the receipt forged, so this retries rather than refuses
     unless (signedBy root intermediate) $ failed "the intermediate is not signed by the configured root"
-    unless (signedBy intermediate leaf) $ Left "the leaf is not signed by the intermediate"
+    case verifySignedSignature leaf (certPubKey $ getCertificate intermediate) of
+      SignaturePass -> Right ()
+      SignatureFailed SignatureInvalid -> Left "the leaf is not signed by the intermediate"
+      SignatureFailed _ -> failed "the intermediate's key cannot check the leaf's signature algorithm"
     -- Apple issues other certificates under this root, developers' among them; only these two mark the receipt-signing chain
     unless (marked receiptSigningLeaf leaf && marked appleIntermediate intermediate) $
       failed "Apple issued this chain, but not to sign receipts"
@@ -172,8 +168,8 @@ minorUnitDigits c
 jsonObject :: Text -> Maybe J.Object
 jsonObject part = J.decodeStrict' =<< eitherToMaybe (B64U.decodeUnpadded $ encodeUtf8 part)
 
-failed :: String -> a
-failed = throw . AppleVerifierFailure
+failed :: Text -> a
+failed = throw . StoreVerifierFailure
 
 readAppleRoot :: FilePath -> IO (Either String SignedCertificate)
 readAppleRoot path =

@@ -6,6 +6,7 @@
 module BadgeService.StoreReceipts
   ( VerifiedStoreTransaction (..),
     StoreRefusal (..),
+    StoreVerifierFailure (..),
     StoreVerifier (..),
     StoreReceipt (..),
     noStoreVerifier,
@@ -13,7 +14,7 @@ module BadgeService.StoreReceipts
   )
 where
 
-import Control.Exception (evaluate)
+import Control.Exception (Exception, catch, evaluate)
 import Data.Bifunctor (first)
 import Data.Char (isAlphaNum, isAscii, isAsciiLower, isAsciiUpper, isControl, isDigit, isPrint, isSpace)
 import Data.Maybe (fromMaybe)
@@ -41,12 +42,19 @@ data VerifiedStoreTransaction = VerifiedStoreTransaction
 -- SRInvalid alone is terminal: the client drops the purchase's keys and nothing presents it again.
 -- So only a verdict no later attempt could change is SRInvalid; when in doubt, SRUnreachable.
 data StoreRefusal
-  = SRInvalid Text -- a verdict that cannot change, and the client consumes the purchase: forged, malformed, another app's, refunded
+  = SRInvalid Text -- a verdict that cannot change, and the client consumes the purchase: forged, malformed, refunded
   | SRPending -- a real purchase the store has not settled; it may yet
   | SRUnreachable Text -- no verdict: the store was not asked, did not answer, or does not know the token (a Play 404 may be lag)
   | SRVerifierFailed Text -- a bug, not the store's answer
   | SRNotConfigured -- no verifier for this store is deployed; the purchase may be real
   deriving (Eq, Show)
+
+-- | Thrown, never returned, by a verifier that cannot reach a verdict, since its Left is terminal.
+-- The reason is logged, so it is always a literal that cannot quote the receipt.
+newtype StoreVerifierFailure = StoreVerifierFailure Text
+  deriving (Show)
+
+instance Exception StoreVerifierFailure
 
 -- | Apple signs its receipt and ships the certificate chain in it, so it is verified with no network
 -- call; a Play token is opaque and must be asked about, which is why only that field is in IO.
@@ -95,6 +103,7 @@ toStoreReceipt StoreVerifier {verifyApple, verifyGoogle, acknowledgeGoogle, veri
     -- nothing was fetched, so a throw or an overrun is a bug or a malformed receipt, never an outage
     offline verdict =
       (fromMaybe (Left $ SRVerifierFailed "apple verifier timed out") <$> timeout verifyTimeout (forced verdict))
+        `catch` (\(StoreVerifierFailure reason) -> pure $ Left $ SRVerifierFailed $ "apple verifier: " <> reason)
         `catchOwn'` \_ -> pure $ Left $ SRVerifierFailed "apple verifier threw"
     online what call =
       (fromMaybe (Left $ SRUnreachable $ what <> " timed out") <$> timeout verifyTimeout (call >>= forced))

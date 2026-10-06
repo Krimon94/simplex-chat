@@ -500,27 +500,24 @@ purchaseWithReceipt key cc purchaseKey masterKey StoreReceipt {txRef = StoreTran
     -- the product is read only for a receipt not yet credited, so retiring it leaves its replays answered
     newPurchase VerifiedStoreTransaction {productId, paid} = case storeProduct provider productId of
       Nothing -> pure $ errorResponse BSEProductUnavailable
-      Just StoreProduct {badgeType, months} -> do
-        now <- badgeNow cc
-        signFirstMonth key cc masterKey badgeType months (SCPayment Nothing) now >>= \case
-          Left resp -> pure resp
-          Right firstMonth -> do
-            paymentId <- randomId cc
-            r <- withDB "writeStorePurchase" cc $ \db ->
-              liftIO (createStorePurchase db NewStorePurchase {paymentId, provider, providerRef, paid, purchaseKey, masterKey, badgeType} now) >>= \case
-                -- Credited to another key, or to this one by a request that ran alongside it, while signing.
-                Nothing ->
-                  fmap Left $
-                    liftIO (getStorePaymentCredit db provider providerRef >>= creditedResponse db BSEReceiptUsed purchaseKey) >>= \case
-                      Left resp -> pure resp
-                      Right () -> logError ("badge service: a payment for " <> providerRef <> " exists but funds no purchase") $> errorResponse BSEInternal
-                Just purchaseId -> liftIO $ Right <$> firstMonthResponse db purchaseId (Just paymentId) firstMonth
-            case r of
-              Right (Right resp) -> acknowledgeCredited $> resp
-              Right (Left resp) -> pure resp
-              Left _ -> pure $ errorResponse BSEInternal
-    acknowledgeCredited = forM_ acknowledgeReceipt $ \acknowledge ->
-      acknowledge >>= either (\refusal -> logError $ "badge service: store purchase " <> providerRef <> " is credited but not acknowledged, so the store will refund it unless the app acknowledges it: " <> tshow refusal) pure
+      Just StoreProduct {badgeType, months} ->
+        fromMaybe (pure $ Right ()) acknowledgeReceipt >>= \case
+          Left refusal -> storeRefusalResponse refusal
+          Right () -> do
+            now <- badgeNow cc
+            signFirstMonth key cc masterKey badgeType months (SCPayment Nothing) now >>= \case
+              Left resp -> pure resp
+              Right firstMonth -> do
+                paymentId <- randomId cc
+                r <- withDB "writeStorePurchase" cc $ \db ->
+                  liftIO (createStorePurchase db NewStorePurchase {paymentId, provider, providerRef, paid, purchaseKey, masterKey, badgeType} now) >>= \case
+                    -- Credited to another key, or to this one by a request that ran alongside it, while signing.
+                    Nothing ->
+                      liftIO (getStorePaymentCredit db provider providerRef >>= creditedResponse db BSEReceiptUsed purchaseKey) >>= \case
+                        Left resp -> pure resp
+                        Right () -> logError ("badge service: a payment for " <> providerRef <> " exists but funds no purchase") $> errorResponse BSEInternal
+                    Just purchaseId -> liftIO $ firstMonthResponse db purchaseId (Just paymentId) firstMonth
+                pure $ fromRight (errorResponse BSEInternal) r
 
 -- | The client learns only the code: a forged receipt, a refunded purchase and a test one are all receipt_invalid.
 storeRefusalResponse :: StoreRefusal -> IO BadgeServiceResponse

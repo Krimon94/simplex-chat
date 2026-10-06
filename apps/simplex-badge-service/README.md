@@ -222,15 +222,15 @@ service_account_file = /etc/simplex-badge-service/play-service-account.json
   for another bundle id, or a chain this root does not verify, is answered `internal` and logged as
   an error rather than refused, since `bundle_id` or `root_certificate` may be the wrong one; check
   both when those errors appear.
-- `[google]` asks the Google Play Developer API about each purchase, and acknowledges it once it is
-  credited, as the service account whose JSON key `service_account_file` holds. The account needs
-  both Play Console permissions Google's
+- `[google]` asks the Google Play Developer API about each purchase, and acknowledges it before
+  crediting it, as the service account whose JSON key `service_account_file` holds. The account
+  needs both Play Console permissions Google's
   [getting started](https://developers.google.com/android-publisher/getting_started) lists for its
   billing APIs: "View financial data, orders, and cancellation survey responses" to read a
-  purchase, and "Manage orders and subscriptions" to acknowledge it. Without the second, every
-  credited Play purchase logs an error that it is not acknowledged, and Play refunds it after three
-  days unless the app acknowledged it. The key signs in for an access token, so keep the file
-  readable by this service alone.
+  purchase, and "Manage orders and subscriptions" to acknowledge it. Without the second, no Play
+  purchase is credited: each is answered `internal` and logged as an error naming the
+  acknowledgement, and the app presents it again once the permission is granted. The key signs in
+  for an access token, so keep the file readable by this service alone.
 
 Which answers are terminal for a purchase and which leave it to be presented again is listed per
 store in [`docs/protocol/badges-rpc.md`](../../docs/protocol/badges-rpc.md#commands).

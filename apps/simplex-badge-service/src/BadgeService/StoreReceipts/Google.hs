@@ -10,11 +10,11 @@ import BadgeService.Config (PlayStoreConfig (..))
 import BadgeService.StoreReceipts (StoreRefusal (..), VerifiedStoreTransaction (..))
 import Control.Concurrent.STM
 import Control.Exception (IOException, try)
-import Control.Monad (void)
 import Crypto.Hash.Algorithms (SHA256 (..))
 import qualified Crypto.PubKey.RSA as RSA
 import qualified Crypto.PubKey.RSA.PKCS15 as RSA
 import qualified Data.Aeson as J
+import Data.Bifunctor (bimap)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as B
 import qualified Data.ByteString.Base64.URL as B64U
@@ -90,7 +90,12 @@ acknowledgePurchase env productId token =
   readPurchase env productId token >>= \case
     Left refusal -> pure $ Left refusal
     Right ProductPurchase {alreadyAcknowledged = True} -> pure $ Right ()
-    Right _ -> void <$> playCall env (\req -> req {method = methodPost}) (purchaseUrl env productId token <> ":acknowledge")
+    Right _ -> bimap acknowledging (const ()) <$> playCall env (\req -> req {method = methodPost}) (purchaseUrl env productId token <> ":acknowledge")
+  where
+    acknowledging = \case
+      SRUnreachable reason -> SRUnreachable $ "acknowledging: " <> reason
+      SRVerifierFailed reason -> SRVerifierFailed $ "acknowledging: " <> reason
+      refusal -> refusal
 
 readPurchase :: PlayEnv -> Text -> Text -> IO (Either StoreRefusal ProductPurchase)
 readPurchase env productId token = (>>= decoded) <$> playCall env id (purchaseUrl env productId token)

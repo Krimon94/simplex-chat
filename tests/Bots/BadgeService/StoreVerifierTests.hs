@@ -42,6 +42,7 @@ badgeStoreVerifierTests = describe "badge store verifiers" $ do
     it "vouches for a transaction a chain to the trusted root signed, naming the transaction it was claimed by" testAppleVerdict
     it "fails, rather than refuses, an intermediate the trusted root did not sign, since the root may be misconfigured" testAppleRootNotTrusted
     it "refuses a leaf the intermediate did not sign, though the intermediate is genuine" testAppleForgedLeaf
+    it "fails, rather than refuses, a leaf signature the library cannot check" testAppleLeafUncheckable
     it "refuses a tampered payload" testAppleTamperedPayload
     it "refuses a chain that is not exactly leaf, intermediate and root" testAppleChainLength
     it "refuses a header that names another algorithm" testAppleOtherAlgorithm
@@ -144,10 +145,12 @@ p256 :: ECC.Curve
 p256 = ECC.getCurveByName ECC.SEC_p256r1
 
 certify :: ECDSA.PrivateKey -> DistinguishedName -> DistinguishedName -> PubKey -> [[Integer]] -> IO SignedCertificate
-certify issuerKey issuerName subjectName subjectKey markers =
+certify = certifyWith $ SignatureALG HashSHA256 PubKeyALG_EC
+
+certifyWith :: SignatureALG -> ECDSA.PrivateKey -> DistinguishedName -> DistinguishedName -> PubKey -> [[Integer]] -> IO SignedCertificate
+certifyWith alg issuerKey issuerName subjectName subjectKey markers =
   objectToSignedExactF sign certificate
   where
-    alg = SignatureALG HashSHA256 PubKeyALG_EC
     certificate =
       Certificate
         { certVersion = 2,
@@ -218,7 +221,9 @@ testAppleRootNotTrusted = do
   forM_ [appleRootName, otherRootName] $ \rootName -> do
     untrusted <- newChain rootName [intermediateMarker] [receiptLeafMarker]
     jws <- signedBy untrusted $ transactionPayload [] []
-    outcome <$> appleVerdict (rootCert trusted) jws `shouldReturn` Failed
+    r <- appleVerdict (rootCert trusted) jws
+    outcome r `shouldBe` Failed
+    reason r `shouldSatisfy` ("configured root" `T.isInfixOf`)
 
 testAppleForgedLeaf :: IO ()
 testAppleForgedLeaf = do
@@ -227,6 +232,16 @@ testAppleForgedLeaf = do
   forgedLeaf <- certify forgedKey intermediateName leafName forgedPub [receiptLeafMarker]
   jws <- signedTransaction chain {leafKey = forgedKey} [forgedLeaf, intermediateCert, rootCert] es256 $ transactionPayload [] []
   outcome <$> appleVerdict rootCert jws `shouldReturn` Invalid
+
+testAppleLeafUncheckable :: IO ()
+testAppleLeafUncheckable = do
+  chain@TestChain {rootCert, intermediateCert} <- trustedChain
+  (otherKey, otherPub) <- newKeyPair
+  rsaLabelled <- certifyWith (SignatureALG HashSHA256 PubKeyALG_RSA) otherKey intermediateName leafName otherPub [receiptLeafMarker]
+  jws <- signedTransaction chain {leafKey = otherKey} [rsaLabelled, intermediateCert, rootCert] es256 $ transactionPayload [] []
+  r <- appleVerdict rootCert jws
+  outcome r `shouldBe` Failed
+  reason r `shouldSatisfy` ("cannot check" `T.isInfixOf`)
 
 testAppleTamperedPayload :: IO ()
 testAppleTamperedPayload = do
@@ -257,7 +272,9 @@ testAppleOtherBundle :: IO ()
 testAppleOtherBundle = do
   chain <- trustedChain
   jws <- signedBy chain $ transactionPayload [("bundleId", "com.example.other")] []
-  outcome <$> appleVerdict (rootCert chain) jws `shouldReturn` Failed
+  r <- appleVerdict (rootCert chain) jws
+  outcome r `shouldBe` Failed
+  reason r `shouldSatisfy` ("bundle id" `T.isInfixOf`)
 
 testAppleRevoked :: IO ()
 testAppleRevoked = do
