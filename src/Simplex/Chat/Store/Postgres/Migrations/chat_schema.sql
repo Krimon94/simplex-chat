@@ -305,7 +305,12 @@ CREATE TABLE test_chat_schema.badge_store_receipts (
     purchase_key bytea NOT NULL,
     purchase_priv_key bytea NOT NULL,
     master_key bytea NOT NULL,
-    created_at timestamp with time zone NOT NULL
+    created_at timestamp with time zone NOT NULL,
+    payment text,
+    next_attempt_at timestamp with time zone,
+    retry_delay bigint,
+    retry_count bigint DEFAULT 0 NOT NULL,
+    credit_error text
 );
 
 
