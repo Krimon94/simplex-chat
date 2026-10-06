@@ -54,6 +54,7 @@ data StoreVerifier = StoreVerifier
   { -- the JWS; every Left becomes SRInvalid, so a verifier that cannot reach a verdict throws instead
     verifyApple :: Maybe (Text -> Either Text VerifiedStoreTransaction),
     verifyGoogle :: Maybe (Text -> Text -> IO (Either StoreRefusal VerifiedStoreTransaction)), -- the product id and the token
+    acknowledgeGoogle :: Maybe (Text -> Text -> IO (Either StoreRefusal ())),
     -- microseconds; requests are answered one at a time, so a verifier that does not finish holds up every other one
     verifyTimeout :: Int
   }
@@ -61,26 +62,32 @@ data StoreVerifier = StoreVerifier
 -- | A store payment, named by the store's own reference before anything is verified.
 data StoreReceipt = StoreReceipt
   { txRef :: StoreTransactionRef,
-    verifyReceipt :: IO (Either StoreRefusal VerifiedStoreTransaction)
+    verifyReceipt :: IO (Either StoreRefusal VerifiedStoreTransaction),
+    acknowledgeReceipt :: Maybe (IO (Either StoreRefusal ()))
   }
 
 noStoreVerifier :: StoreVerifier
-noStoreVerifier = StoreVerifier {verifyApple = Nothing, verifyGoogle = Nothing, verifyTimeout = 10000000}
+noStoreVerifier = StoreVerifier {verifyApple = Nothing, verifyGoogle = Nothing, acknowledgeGoogle = Nothing, verifyTimeout = 10000000}
 
 -- | Nothing for a payment no store made. Exceptions are not logged, since they can quote the receipt
 -- or, from Google, a URL holding the token.
 toStoreReceipt :: StoreVerifier -> ServicePayment -> Maybe (Either StoreRefusal StoreReceipt)
-toStoreReceipt StoreVerifier {verifyApple, verifyGoogle, verifyTimeout} = \case
+toStoreReceipt StoreVerifier {verifyApple, verifyGoogle, acknowledgeGoogle, verifyTimeout} = \case
   SPApple {jws} -> Just $ case appleTransactionId jws of
     Nothing -> Left $ SRInvalid "names no transaction"
-    Just ref -> Right $ StoreReceipt (StoreTransactionRef PPApple ref) $ maybe unconfigured (\verify -> offline $ first SRInvalid $ verify jws) verifyApple
+    Just ref -> Right $ StoreReceipt (StoreTransactionRef PPApple ref) (maybe unconfigured (\verify -> offline $ first SRInvalid $ verify jws) verifyApple) Nothing
   SPGoogle {productId, token}
     -- the claim is the token's hash, so neither string may name any purchase but the one it claims,
     -- whatever path a verifier builds from them
     | not (googleProductId productId) -> Just $ Left $ SRInvalid "not a Play product id"
     -- Play documents no token grammar, so this is our guess, and refusing to ask Play is not its verdict
     | not (googleToken token) -> Just $ Left $ SRUnreachable $ "a Play token this service will not send: " <> tokenShape token
-    | otherwise -> Just $ Right $ StoreReceipt (StoreTransactionRef PPGoogle (googlePurchaseRef token)) $ maybe unconfigured (\verify -> online $ verify productId token) verifyGoogle
+    | otherwise ->
+        Just $ Right $
+          StoreReceipt
+            (StoreTransactionRef PPGoogle (googlePurchaseRef token))
+            (maybe unconfigured (\verify -> online "google verifier" $ verify productId token) verifyGoogle)
+            ((\acknowledge -> online "google acknowledgement" $ acknowledge productId token) <$> acknowledgeGoogle)
   SPInvoice {} -> Nothing
   SPReceipt {} -> Nothing
   where
@@ -89,9 +96,9 @@ toStoreReceipt StoreVerifier {verifyApple, verifyGoogle, verifyTimeout} = \case
     offline verdict =
       (fromMaybe (Left $ SRVerifierFailed "apple verifier timed out") <$> timeout verifyTimeout (forced verdict))
         `catchOwn'` \_ -> pure $ Left $ SRVerifierFailed "apple verifier threw"
-    online verify =
-      (fromMaybe (Left $ SRUnreachable "google verifier timed out") <$> timeout verifyTimeout (verify >>= forced))
-        `catchOwn'` \_ -> pure $ Left $ SRUnreachable "google verifier threw"
+    online what call =
+      (fromMaybe (Left $ SRUnreachable $ what <> " timed out") <$> timeout verifyTimeout (call >>= forced))
+        `catchOwn'` \_ -> pure $ Left $ SRUnreachable $ what <> " threw"
     -- a verdict holding a thunk that throws would otherwise throw later, outside these handlers
     forced = either (fmap Left . evaluate) (fmap Right . evaluate)
 

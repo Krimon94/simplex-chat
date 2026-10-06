@@ -12,7 +12,7 @@ where
 
 import BadgeService.StoreReceipts (VerifiedStoreTransaction (..))
 import Control.Exception (Exception, IOException, throw, try)
-import Control.Monad (guard, unless, when)
+import Control.Monad (guard, unless)
 import Crypto.Hash.Algorithms (SHA256 (..))
 import Crypto.Number.Serialize (os2ip)
 import qualified Crypto.PubKey.ECC.ECDSA as ECDSA
@@ -32,7 +32,7 @@ import Data.Text.Encoding (encodeUtf8)
 import Data.Word (Word32)
 import Data.X509
 import Data.X509.EC (unserializePoint)
-import Data.X509.Validation (SignatureVerification (..), verifySignedSignature)
+import Data.X509.Validation (SignatureVerification (SignaturePass), verifySignedSignature)
 import Simplex.Chat.PaymentService.Types (CurrencyAmount (..))
 import Simplex.Messaging.Util (eitherToMaybe)
 
@@ -76,10 +76,8 @@ signingChain root = \case
     leaf <- certificate leafDer
     intermediate <- certificate intermediateDer
     -- the configured root may be stale or wrong as likely as the receipt forged, so this decides nothing
-    when (certIssuerDN (getCertificate intermediate) /= certSubjectDN (getCertificate root)) $
-      failed "the intermediate is issued by a root other than the configured one"
-    signedBy root intermediate "the intermediate is not signed by the configured root"
-    signedBy intermediate leaf "the leaf is not signed by the intermediate"
+    unless (signedBy root intermediate) $ failed "the intermediate is not signed by the configured root"
+    unless (signedBy intermediate leaf) $ Left "the leaf is not signed by the intermediate"
     -- Apple issues other certificates under this root, developers' among them; only these two mark the receipt-signing chain
     unless (marked receiptSigningLeaf leaf && marked appleIntermediate intermediate) $
       failed "Apple issued this chain, but not to sign receipts"
@@ -87,9 +85,7 @@ signingChain root = \case
   _ -> Left "x5c is not leaf, intermediate and root"
   where
     certificate = either (const $ Left "an x5c certificate does not decode") Right . decodeSignedCertificate
-    signedBy issuer cert refusal = case verifySignedSignature cert (certPubKey $ getCertificate issuer) of
-      SignaturePass -> Right ()
-      SignatureFailed _ -> Left refusal
+    signedBy issuer cert = verifySignedSignature cert (certPubKey $ getCertificate issuer) == SignaturePass
     marked oid cert = case certExtensions (getCertificate cert) of
       Extensions (Just exts) -> any ((== oid) . extRawOID) exts
       Extensions Nothing -> False
@@ -134,7 +130,8 @@ appleTransactionP o = do
 
 transaction :: Text -> AppleTransaction -> Either Text VerifiedStoreTransaction
 transaction ourBundleId AppleTransaction {transactionId, productId, bundleId, environment, quantity, revoked, price, currency}
-  | bundleId /= ourBundleId = Left "another app's bundle id"
+  -- the configured bundle id may be the wrong one, and refusing for good would destroy every genuine purchase
+  | bundleId /= ourBundleId = failed "another app's bundle id, or ours misconfigured"
   | revoked = Left "refunded or revoked"
   | otherwise =
       Right

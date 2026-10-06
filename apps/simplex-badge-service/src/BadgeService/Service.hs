@@ -145,7 +145,15 @@ configureStoreVerifier serviceCfg env@ServiceState {storeVerifier = v} = case se
     apple <- forM appleStore $ \AppleStoreConfig {aBundleId, aRootCertificate} ->
       (\root -> verifyAppleTransaction root aBundleId) <$> orExit (readAppleRoot aRootCertificate)
     google <- forM playStore $ orExit . playStoreVerifier
-    pure env {storeVerifier = v {verifyApple = maybe (verifyApple v) Just apple, verifyGoogle = maybe (verifyGoogle v) Just google}}
+    pure
+      env
+        { storeVerifier =
+            v
+              { verifyApple = maybe (verifyApple v) Just apple,
+                verifyGoogle = maybe (verifyGoogle v) (Just . fst) google,
+                acknowledgeGoogle = maybe (acknowledgeGoogle v) (Just . snd) google
+              }
+        }
   Nothing -> pure env
   where
     orExit = (>>= either (\e -> putStrLn ("Error: " <> e) >> exitFailure) pure)
@@ -462,7 +470,7 @@ redeemCode key cc purchaseKey masterKey codeText = case parseBadgeCode codeText 
 -- | Every refusal is answered before anything is written, so it leaves the receipt unclaimed; and
 -- nothing is written until the credential is signed.
 purchaseWithReceipt :: BadgeIssuerKey -> ChatController -> C.PublicKeyEd25519 -> BadgeMasterKey -> StoreReceipt -> IO BadgeServiceResponse
-purchaseWithReceipt key cc purchaseKey masterKey StoreReceipt {txRef = StoreTransactionRef {provider, transactionRef = providerRef}, verifyReceipt} =
+purchaseWithReceipt key cc purchaseKey masterKey StoreReceipt {txRef = StoreTransactionRef {provider, transactionRef = providerRef}, verifyReceipt, acknowledgeReceipt} =
   withDB' "getStorePayment" cc (\db -> getStorePaymentCredit db provider providerRef) >>= \case
     Left _ -> pure $ errorResponse BSEInternal
     Right credit
@@ -502,11 +510,17 @@ purchaseWithReceipt key cc purchaseKey masterKey StoreReceipt {txRef = StoreTran
               liftIO (createStorePurchase db NewStorePurchase {paymentId, provider, providerRef, paid, purchaseKey, masterKey, badgeType} now) >>= \case
                 -- Credited to another key, or to this one by a request that ran alongside it, while signing.
                 Nothing ->
-                  liftIO (getStorePaymentCredit db provider providerRef >>= creditedResponse db BSEReceiptUsed purchaseKey) >>= \case
-                    Left resp -> pure resp
-                    Right () -> logError ("badge service: a payment for " <> providerRef <> " exists but funds no purchase") $> errorResponse BSEInternal
-                Just purchaseId -> liftIO $ firstMonthResponse db purchaseId (Just paymentId) firstMonth
-            pure $ fromRight (errorResponse BSEInternal) r
+                  fmap Left $
+                    liftIO (getStorePaymentCredit db provider providerRef >>= creditedResponse db BSEReceiptUsed purchaseKey) >>= \case
+                      Left resp -> pure resp
+                      Right () -> logError ("badge service: a payment for " <> providerRef <> " exists but funds no purchase") $> errorResponse BSEInternal
+                Just purchaseId -> liftIO $ Right <$> firstMonthResponse db purchaseId (Just paymentId) firstMonth
+            case r of
+              Right (Right resp) -> acknowledgeCredited $> resp
+              Right (Left resp) -> pure resp
+              Left _ -> pure $ errorResponse BSEInternal
+    acknowledgeCredited = forM_ acknowledgeReceipt $ \acknowledge ->
+      acknowledge >>= either (\refusal -> logError $ "badge service: store purchase " <> providerRef <> " is credited but not acknowledged, so the store will refund it unless the app acknowledges it: " <> tshow refusal) pure
 
 -- | The client learns only the code: a forged receipt, a refunded purchase and a test one are all receipt_invalid.
 storeRefusalResponse :: StoreRefusal -> IO BadgeServiceResponse
