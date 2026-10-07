@@ -5271,14 +5271,12 @@ handOverStoreReceipt presentingUser echoedInvoiceId payment = do
   void requireBadgeService
   g <- asks random
   now <- badgeNow
-  (StoreReceipt {ownerId, status}, newlyHeld) <-
+  BadgeReceiptRecord {ownerId, status} <-
     withStore' (\db -> holdStoreReceipt db g presentingUser echoedInvoiceId txRef payment now)
       >>= maybe (throwChatError $ CEInternalError "store receipt was not recorded") pure
-  -- before the answer, which can throw: no later hand-over of this receipt signals, and a spare signal costs an empty pass
-  when newlyHeld $ lift $ resumeStoreReceiptWork ownerId
   owner <- withStore $ \db -> getUser db ownerId
   case status of
-    RSHeld -> badgeStateResponse owner
+    RSHeld {} -> lift (resumeStoreReceiptWork ownerId) >> badgeStateResponse owner
     RSCredited {badgePurchaseId} -> do
       cred_ <- withStore' (`getLatestIssuedCredential` badgePurchaseId)
       cred@(BadgeCredential _ _ _ info) <- maybe (throwChatError $ CEInternalError "credited store purchase has no credential") pure cred_
@@ -5452,16 +5450,21 @@ runStoreReceiptWorker a userId Worker {doWork} = do
   scheduled <- newTVarIO S.empty
   forever $ do
     lift $ waitForWork doWork
-    withWork_ a doWork (getDueReceipt scheduled) $ creditStoreReceipt a userId
+    withWork_ a doWork (getDueReceipt scheduled) $ \case
+      BadgeReceiptRecord {receiptId, status = RSHeld {stash, payment, retryDelay}} -> creditStoreReceipt a userId receiptId stash payment retryDelay
+      BadgeReceiptRecord {receiptId} -> notHeld receiptId
   where
     getDueReceipt scheduled =
       withStore' (`getNextHeldStoreReceipt` userId) >>= \case
-        Right (Just r@HeldStoreReceipt {receiptId, nextAttemptAt}) -> do
+        Right (Just r@BadgeReceiptRecord {receiptId, status = RSHeld {nextAttemptAt}}) -> do
           now <- badgeNow
           if nextAttemptAt <= now
             then pure $ Right (Just r)
             else Right Nothing <$ scheduleReceipt scheduled receiptId (diffUTCTime nextAttemptAt now)
+        Right (Just BadgeReceiptRecord {receiptId}) -> Right Nothing <$ notHeld receiptId
         r -> pure r
+    -- getNextHeldStoreReceipt reads held rows only, so this says its query and its result type disagree
+    notHeld receiptId = eToView $ ChatError $ CEInternalError $ "store receipt " <> show receiptId <> " is not held"
     scheduleReceipt scheduled receiptId delay = do
       new <- atomically $ stateTVar scheduled $ \ids -> (S.notMember receiptId ids, S.insert receiptId ids)
       when new . void . liftIO . forkIO $ do
@@ -5472,8 +5475,8 @@ runStoreReceiptWorker a userId Worker {doWork} = do
 data StoreReceiptOutcome = SROCredited (Maybe User) | SRORefused | SRORetry | SRODeferred
 
 -- | Under the owner's badge lock, which keeps a profile's requests to the service serial.
-creditStoreReceipt :: AgentClient -> UserId -> HeldStoreReceipt -> CM ()
-creditStoreReceipt a userId HeldStoreReceipt {receiptId, stash = stash@BadgeStash {masterKey}, payment, retryDelay} = do
+creditStoreReceipt :: AgentClient -> UserId -> Int64 -> BadgeStash -> Text -> Maybe Int64 -> CM ()
+creditStoreReceipt a userId receiptId stash@BadgeStash {masterKey} payment retryDelay = do
   ChatConfig {badgeRetryInterval = ri, badgeConsecutiveRetries} <- asks config
   withRetryIntervalCount (maybe ri (\d -> ri {initialInterval = d, increaseAfter = 0}) retryDelay) $ \n delay loop -> do
     liftIO $ waitWhileSuspended a
@@ -5485,15 +5488,15 @@ creditStoreReceipt a userId HeldStoreReceipt {receiptId, stash = stash@BadgeStas
           | storeReceiptRefused code -> SRORefused <$ withStore' (\db -> refuseStoreReceipt db receiptId $ serviceFailure code retryAfter)
           | otherwise -> failed ri delay (serviceFailure code retryAfter) retryAfter
         Left e -> failed ri delay (badgeIssueFailure e) Nothing
-    -- only a settlement is announced, and the app's sweep in answer signals this worker only for a newly held receipt, so it cannot loop
+    -- only a settlement is announced, and the sweep it prompts signals this worker only for a receipt still held, so it cannot loop
     case outcome of
       SROCredited present_ -> do
         user <- withStore $ \db -> getUser db userId
         toView . CEvtBadgeChanged user =<< getUserBadgeState user
-        toView $ CEvtStorePurchaseSettled user
+        toView $ CEvtStorePurchaseResolved user
         -- last, so a failed broadcast cannot lose the settlement; outside the badge lock, as it takes the chat lock
         mapM_ presentUserBadgeToContacts present_
-      SRORefused -> withStore (`getUser` userId) >>= toView . CEvtStorePurchaseSettled
+      SRORefused -> withStore (`getUser` userId) >>= toView . CEvtStorePurchaseResolved
       SRORetry | n + 1 < badgeConsecutiveRetries -> loop
       _ -> pure ()
   where
